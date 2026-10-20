@@ -57,3 +57,7 @@ cp painel_teste/segredos.exemplo.h painel_teste/segredos.h
 
 Dumps do chip (`*.bin` — o dump de flash cobre a área onde o ESP32 guarda a senha do WiFi),
 capturas de console do Pi (`captura_*.txt`) e os `segredos.h`.
+
+## Licença
+
+MIT — ver [`LICENSE`](LICENSE).
