@@ -1,0 +1,329 @@
+/*
+ * SONDA ESP32 — 5 fios: I2C escravo (telemetria) + UART2 (terminal)
+ * ----------------------------------------------------------------
+ * Arquitetura de ARQUITETURA-5fios.md (decisão do Thiago, 2026-08-01).
+ *   - I2C (GPIO21 SDA / GPIO22 SCL): ESP é ESCRAVO 0x08. O Pi (mestre) puxa o
+ *     JSON de telemetria (bateria + scans WiFi/BLE).
+ *   - UART2 (GPIO16 RX / GPIO17 TX @115200): terminal interativo. Comandos de
+ *     texto (scan/bat/wifi/ble/reboot/help) → resposta em texto. Também aceita
+ *     os mesmos comandos pela USB (Serial0) p/ testar sem o Pi.
+ *
+ * Fiação (3,3V dos 2 lados, SEM level shifter):
+ *   I2C  não cruza:  ESP GPIO21<->Pi SDA(pino3) ; ESP GPIO22<->Pi SCL(pino5)
+ *   UART cruza:      ESP GPIO17(TX2)->Pi RXD(pino10) ; ESP GPIO16(RX2)<-Pi TXD(pino8)
+ *   GND comum (pino6) obrigatório, compartilhado pelos 2 barramentos.
+ * Bateria: divisor 100k/100k no GPIO34 (ADC1 — funciona com WiFi).
+ *
+ * Blindagem do escravo I2C (o Wire slave é frágil durante scan):
+ *   - scan é ASSÍNCRONO (loop nunca trava) e BLE por callback;
+ *   - a telemetria é montada num buffer "live" no loop;
+ *   - o Pi, ao escrever o registrador 0x00, LATCHA o live num snapshot estável;
+ *   - o onRequest só COPIA do snapshot (nada de processar no callback).
+ */
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_flash.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+// ---- pinos / config
+static const uint8_t I2C_ADDR = 0x08;
+static const int PIN_SDA = 21, PIN_SCL = 22;
+static const int PIN_TX2 = 17, PIN_RX2 = 16;
+static const uint32_t BAUD_TERM = 115200;
+static const int   PIN_BAT = 34;
+static const float DIVISOR = 2.0f;
+// CALIBRACAO (01/08): sem correcao a sonda lia 4.147 V com o multimetro medindo 3.81 V
+// na celula (+8,8%). Fator = 3.81/4.147. Causa provavel: Vref do ADC deste chip (o ESP32
+// usa 1100 mV default quando nao tem eFuse de calibracao) e/ou tolerancia dos resistores.
+// Pra recalibrar: zere p/ 1.0, leia "bat", meça a celula e refaça medido/lido.
+static const float CAL_ADC = 0.9187f;
+static const float V_CHEIA=4.15f, V_OK=3.60f, V_BAIXA=3.40f, V_CRITICA=3.20f;
+// abaixo disso nao ha bateria no divisor (placa so no USB) -> nao e "critico", e "sem bateria"
+static const float V_SEM_BAT=1.00f;
+
+// ---- LED RGB de status (4 pinos: R,G,B + comum)
+// FIACAO REAL, provada 3x na bancada (firmware led_teste + observacao do estado ocioso):
+//   GPIO25 -> die AZUL | GPIO26 -> die VERDE | GPIO27 -> die VERMELHO
+// O LED entrou espelhado no soquete, entao R e B vem TROCADOS de proposito aqui.
+// Tentamos a ordem natural em 02/08 e o estado ocioso (azul respirando) saiu VERMELHO
+// respirando -> prova de que o espelhamento e fisico. NAO "arrumar" sem re-testar com
+// "led r" / "led b": o ciclo do led_teste e a fonte da verdade.
+static const int PIN_R=27, PIN_G=26, PIN_B=25;
+// 1o LED tinha o die verde morto (GPIO26 provado vivo); trocado -> paleta completa de volta.
+static const bool TEM_VERDE = true;
+
+// ---- LED da placa (onboard) = batimento cardiaco, em CONTRAFASE com o azul do RGB
+static const int  PIN_PLACA = 2;              // LED azul onboard da maioria dos DevKit
+static const bool PLACA_INVERTIDO = false;    // true se o onboard acender em nivel BAIXO
+static const uint16_t HB_PERIODO = 1200;      // ms do ciclo completo do batimento
+// O pulso vive SO no LED da placa (decisao do Thiago, 02/08): o RGB fica com cor estavel,
+// entao "esta viva" se le no onboard e "qual o estado" se le na cor. Um sinal, um lugar.
+static const uint8_t  AZUL_OCIOSO = 40;       // azul fixo do RGB quando viva e sem o Pi
+// true  = comum no 3,3V (anodo comum): ligar = nivel BAIXO (invertido)
+// false = comum no GND (catodo comum): ligar = nivel ALTO
+// Se as cores saírem trocadas/aceso quando devia apagar -> troque este flag e regrave.
+static const bool COMMON_ANODE = false;
+volatile uint32_t lastI2Cms = 0;      // quando o Pi leu por I2C pela última vez
+// teste manual de canal (comando "led r|g|b|off"): trava a cor ate expirar
+uint32_t ledTesteAte=0; uint8_t ledTR=0, ledTG=0, ledTB=0;
+
+// ---- registradores I2C
+static const uint8_t REG_LEN  = 0x00;   // Pi escreve -> latcha; lê 2 bytes (LEN uint16 LE)
+static const uint8_t REG_DATA = 0x01;   // Pi lê em blocos de 32B, cursor avança
+static const int CHUNK = 32;
+
+// ---- estado
+float baterioV=0; int baterioPct=0; String baterioMsg="—";
+struct RedeWiFi { String ssid; int rssi,canal; String cripto; };
+RedeWiFi wifiAch[24]; uint8_t wifiQtd=0;
+struct DispBLE { String end,nome; int rssi; };
+DispBLE bleAch[24]; uint8_t bleQtd=0;
+BLEScan *bleScan=nullptr; bool bleBusy=false; uint32_t bleT=0;
+
+// buffers da telemetria
+char live[3072]; volatile uint16_t liveLen=0;              // montado no loop
+char snap[3072]; volatile uint16_t snapLen=0;              // latchado p/ o I2C
+volatile uint16_t cursor=0; volatile uint8_t reg=REG_LEN;
+
+// ---- bateria
+float lerBateria(){ uint32_t s=0; for(int i=0;i<16;i++){s+=analogReadMilliVolts(PIN_BAT);delay(2);} return (s/16.0f)*DIVISOR*CAL_ADC/1000.0f; }
+// tabela de descarga da LiPo: {tensao, %}, do cheio pro vazio. Interpola dentro do degrau.
+int pctLiPo(float v){
+  static const float t[][2]={{4.20,100},{4.10,90},{4.00,80},{3.90,70},{3.85,60},{3.80,50},
+                             {3.75,40},{3.70,30},{3.60,20},{3.50,12},{3.40,7},{3.30,3},{3.00,0}};
+  static const int N = sizeof(t)/sizeof(t[0]);
+  if(v>=t[0][0])   return 100;
+  if(v<=t[N-1][0]) return 0;
+  for(int i=0;i<N-1;i++){
+    if(v<=t[i][0] && v>=t[i+1][0]){                     // achou o degrau que contem v
+      float f=(v-t[i+1][0])/(t[i][0]-t[i+1][0]);        // 0 no fundo do degrau, 1 no topo
+      return (int)(t[i+1][1] + f*(t[i][1]-t[i+1][1]) + 0.5f);
+    }
+  }
+  return 50;
+}
+void atualizarBateria(){
+  baterioV=lerBateria(); baterioPct=pctLiPo(baterioV);
+  if(baterioV<V_SEM_BAT) baterioMsg="sem bateria (alimentada pelo USB)";
+  else if(baterioV<V_CRITICA) baterioMsg="CRITICA — desligue e carregue ja (risco de dano)";
+  else if(baterioV<V_BAIXA) baterioMsg="carregar agora";
+  else if(baterioV<V_OK) baterioMsg="carregar em breve";
+  else if(baterioV>=V_CHEIA) baterioMsg="cheia / carregando";
+  else baterioMsg="ok";
+}
+
+// ---- BLE / WiFi
+class CbBLE : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice d) override {
+    String e=d.getAddress().toString().c_str();
+    for(uint8_t i=0;i<bleQtd;i++) if(bleAch[i].end==e){bleAch[i].rssi=d.getRSSI();return;}
+    if(bleQtd>=24)return;
+    bleAch[bleQtd].end=e; bleAch[bleQtd].nome=d.haveName()?String(d.getName().c_str()):String("(sem nome)");
+    bleAch[bleQtd].rssi=d.getRSSI(); bleQtd++;
+  }
+};
+void scanBLE(){ if(bleBusy)return; bleQtd=0; bleBusy=true;
+  bleScan->start(4,[](BLEScanResults r){bleBusy=false;},false); bleT=millis(); }
+const char* cripto(wifi_auth_mode_t m){ switch(m){
+  case WIFI_AUTH_OPEN:return "aberta"; case WIFI_AUTH_WEP:return "WEP";
+  case WIFI_AUTH_WPA_PSK:return "WPA"; case WIFI_AUTH_WPA2_PSK:return "WPA2";
+  case WIFI_AUTH_WPA_WPA2_PSK:return "WPA/2"; case WIFI_AUTH_WPA3_PSK:return "WPA3";
+  case WIFI_AUTH_WPA2_WPA3_PSK:return "WPA2/3"; default:return "?";} }
+void coletarWiFi(){
+  int n=WiFi.scanComplete();
+  if(n==WIFI_SCAN_FAILED){ WiFi.scanNetworks(true,true); return; }
+  if(n==WIFI_SCAN_RUNNING) return;
+  wifiQtd=0;
+  for(int i=0;i<n&&wifiQtd<24;i++)
+    wifiAch[wifiQtd++]={ WiFi.SSID(i).length()?WiFi.SSID(i):String("(oculta)"),
+                         WiFi.RSSI(i), WiFi.channel(i), String(cripto(WiFi.encryptionType(i))) };
+  WiFi.scanDelete(); WiFi.scanNetworks(true,true);
+}
+
+// ---- monta a telemetria (link=i2c) no buffer live
+void montarLive(){
+  String j="{\"bat\":{\"v\":"; j+=String(baterioV,3); j+=",\"pct\":"; j+=baterioPct;
+  j+=",\"msg\":\""; j+=baterioMsg; j+="\"}";
+  j+=",\"wifi\":[";
+  for(uint8_t i=0;i<wifiQtd;i++){ if(i)j+=",";
+    j+="{\"s\":\""; j+=wifiAch[i].ssid; j+="\",\"r\":"; j+=wifiAch[i].rssi;
+    j+=",\"c\":"; j+=wifiAch[i].canal; j+=",\"k\":\""; j+=wifiAch[i].cripto; j+="\"}"; }
+  j+="]";
+  j+=",\"ble\":[";
+  for(uint8_t i=0;i<bleQtd;i++){ if(i)j+=",";
+    j+="{\"e\":\""; j+=bleAch[i].end; j+="\",\"n\":\""; j+=bleAch[i].nome;
+    j+="\",\"r\":"; j+=bleAch[i].rssi; j+="}"; }
+  j+="]";
+  uint32_t fl=0; esp_flash_get_size(NULL,&fl); uint32_t up=millis()/1000;
+  j+=",\"sis\":{\"mac\":\""; j+=WiFi.macAddress();
+  j+="\",\"flash_mb\":"; j+=fl/(1024*1024);
+  j+=",\"heap_kb\":"; j+=ESP.getFreeHeap()/1024;
+  j+=",\"up_s\":"; j+=up; j+=",\"link\":\"i2c\"}}\n";
+  uint16_t n=j.length(); if(n>=sizeof(live))n=sizeof(live)-1;
+  memcpy(live, j.c_str(), n); live[n]=0; liveLen=n;
+}
+
+// ---- LED RGB de status
+void setColor(uint8_t r,uint8_t g,uint8_t b){
+  if(COMMON_ANODE){ r=255-r; g=255-g; b=255-b; }
+  analogWrite(PIN_R,r); analogWrite(PIN_G,g); analogWrite(PIN_B,b);
+}
+// ---- batimento cardiaco (lub-dub): envelope 0..255 dentro de HB_PERIODO
+static uint8_t pulso(uint16_t x, uint16_t dur, uint8_t pico){
+  if(x>=dur) return 0;
+  uint16_t subida = dur/3;                               // sobe rapido, cai suave
+  if(x < subida) return (uint32_t)pico*x/subida;
+  return (uint32_t)pico*(dur-x)/(dur-subida);
+}
+uint8_t batimento(uint32_t now){
+  uint16_t t = now % HB_PERIODO;
+  if(t < 200)             return pulso(t,     200, 255); // "lub" — a batida forte
+  if(t >= 280 && t < 460) return pulso(t-280, 180, 150); // "dub" — a eco, mais fraca
+  return 0;                                              // diastole: descanso
+}
+
+void ledStatus(){
+  uint32_t now=millis();
+  uint8_t hb = batimento(now);
+  // LED da placa pulsa SEMPRE (sinal de "estou viva"), independente do status do RGB
+  analogWrite(PIN_PLACA, PLACA_INVERTIDO ? 255-hb : hb);
+
+  if(ledTesteAte){                                       // teste manual de canal ganha de tudo
+    if((int32_t)(now-ledTesteAte) < 0){ setColor(ledTR,ledTG,ledTB); return; }
+    ledTesteAte=0;                                       // expirou -> volta ao automatico
+  }
+  bool piVivo = (lastI2Cms && now-lastI2Cms < 3000);   // Pi puxou I2C há pouco
+  bool semBat = (baterioV < V_SEM_BAT);                  // so USB: nao e critico, e ausencia
+  bool pisca = (now/500)%2;                              // blink 1Hz
+  if(!semBat && baterioV < V_CRITICA){ setColor(pisca?255:0,0,0); }    // vermelho piscando
+  else if(!semBat && baterioV < V_BAIXA){                               // carregar
+    if(TEM_VERDE) setColor(255,40,0);                                   //   ambar
+    else          setColor(pisca?255:60,0,0); }                         //   vermelho pulsando (sem apagar)
+  else if(bleBusy || WiFi.scanComplete()==WIFI_SCAN_RUNNING){ setColor(40,0,60); } // roxo: escaneando
+  else if(piVivo){                                                      // Pi lendo (saudavel)
+    if(TEM_VERDE) setColor(0,120,0);                                    //   verde
+    else          setColor(0,0,255); }                                  //   azul FORTE fixo
+  else { setColor(0,0,AZUL_OCIOSO); }        // azul fixo: vivo, sem Pi (o pulso e so da placa)
+}
+
+// ---- I2C escravo (callbacks rodam em task, não ISR, no core 3.x)
+void onReceiveI2C(int n){
+  if(n<=0)return;
+  reg = Wire.read();                       // 1º byte = registrador
+  while(Wire.available()) Wire.read();      // descarta o resto
+  if(reg==REG_LEN){                         // latcha um frame estável
+    uint16_t L=liveLen; if(L>=sizeof(snap))L=sizeof(snap)-1;
+    memcpy(snap, live, L); snapLen=L; cursor=0;
+  }
+}
+void onRequestI2C(){
+  if(reg==REG_LEN){
+    uint8_t b[2]={ (uint8_t)(snapLen & 0xFF), (uint8_t)(snapLen>>8) };
+    Wire.write(b,2);
+  } else {                                  // REG_DATA: próximo bloco de 32B
+    uint8_t buf[CHUNK];
+    for(int i=0;i<CHUNK;i++){ buf[i] = (cursor<snapLen)? (uint8_t)snap[cursor++] : 0; }
+    Wire.write(buf,CHUNK);
+  }
+  lastI2Cms = millis();                      // marca atividade do Pi (p/ o LED)
+}
+
+// ---- terminal (UART2 e USB)
+void responder(Stream &s, const String &cmd){
+  String c=cmd; c.trim(); c.toLowerCase();
+  if(c=="help"||c=="?"){
+    s.println("comandos: help  bat  wifi  ble  scan  sis  led <r|g|b|w|off|auto>  reboot");
+  } else if(c.startsWith("led")){
+    String a=c.substring(3); a.trim();
+    uint8_t r=0,g=0,b=0; bool auto_=false;
+    if(a=="r"||a=="vermelho") r=255;
+    else if(a=="g"||a=="verde") g=255;
+    else if(a=="b"||a=="azul") b=255;
+    else if(a=="w"||a=="branco"){ r=g=b=255; }
+    else if(a=="off"||a=="apaga"){ /* tudo 0 */ }
+    else if(a==""||a=="auto") auto_=true;
+    else { s.println("uso: led r|g|b|w|off|auto"); return; }
+    if(auto_){ ledTesteAte=0; s.println("led: automatico (status)"); }
+    else { ledTR=r; ledTG=g; ledTB=b; ledTesteAte=millis()+30000; if(!ledTesteAte)ledTesteAte=1;
+           s.printf("led: canal fixo R=%u G=%u B=%u por 30s (o que voce VE?)\n", r,g,b); }
+  } else if(c=="bat"){
+    s.printf("bateria: %.3f V  %d%%  (%s)\n", baterioV, baterioPct, baterioMsg.c_str());
+  } else if(c=="wifi"){
+    s.printf("%u redes 2,4GHz:\n", wifiQtd);
+    for(uint8_t i=0;i<wifiQtd;i++) s.printf("  %-24s ch%-3d %-6s %d dBm\n",
+      wifiAch[i].ssid.c_str(), wifiAch[i].canal, wifiAch[i].cripto.c_str(), wifiAch[i].rssi);
+  } else if(c=="ble"){
+    s.printf("%u dispositivos BLE:\n", bleQtd);
+    for(uint8_t i=0;i<bleQtd;i++) s.printf("  %s  %-18s %d dBm\n",
+      bleAch[i].end.c_str(), bleAch[i].nome.c_str(), bleAch[i].rssi);
+  } else if(c=="scan"){
+    WiFi.scanNetworks(true,true); scanBLE(); s.println("scan disparado (WiFi+BLE)");
+  } else if(c=="sis"){
+    uint32_t fl=0; esp_flash_get_size(NULL,&fl);
+    s.printf("MAC %s | flash %u MB | heap %u KB | up %lus\n",
+      WiFi.macAddress().c_str(), fl/(1024*1024), ESP.getFreeHeap()/1024, millis()/1000);
+  } else if(c=="reboot"){
+    s.println("reiniciando..."); delay(200); ESP.restart();
+  } else if(c.length()){
+    s.println("? (digite help)");
+  }
+}
+String bufTerm2="", bufTerm0="";
+void lerTerminal(Stream &s, String &buf){
+  while(s.available()){
+    char ch=(char)s.read();
+    if(ch=='\r') continue;
+    if(ch=='\n'){ responder(s, buf); buf=""; }
+    else if(buf.length()<120) buf+=ch;
+  }
+}
+
+#define DBG(x) do{ Serial.println(x); Serial.flush(); }while(0)
+void setup(){
+  Serial.begin(115200); delay(300);
+  DBG("STEP1 serial ok");
+  Serial2.begin(BAUD_TERM, SERIAL_8N1, PIN_RX2, PIN_TX2);
+  analogReadResolution(12); analogSetPinAttenuation(PIN_BAT, ADC_11db);
+  DBG("STEP2 uart+adc ok");
+
+  pinMode(PIN_R,OUTPUT); pinMode(PIN_G,OUTPUT); pinMode(PIN_B,OUTPUT);
+  pinMode(PIN_PLACA,OUTPUT);
+  setColor(0,0,40);
+  DBG("STEP3 led ok");
+
+  WiFi.mode(WIFI_STA); WiFi.disconnect();
+  DBG("STEP4 wifi ok");
+  BLEDevice::init("");
+  bleScan=BLEDevice::getScan();
+  bleScan->setAdvertisedDeviceCallbacks(new CbBLE(), true);
+  bleScan->setActiveScan(true); bleScan->setInterval(100); bleScan->setWindow(99);
+  DBG("STEP5 ble ok");
+
+  atualizarBateria(); montarLive();
+  memcpy(snap,live,liveLen); snapLen=liveLen;
+  DBG("STEP6 telemetria ok");
+
+  Wire.setPins(PIN_SDA, PIN_SCL);          // pinos ANTES do begin
+  Wire.onReceive(onReceiveI2C);            // callbacks ANTES do begin (exigencia do slave 3.x)
+  Wire.onRequest(onRequestI2C);
+  Wire.begin(I2C_ADDR);                     // agora sobe como ESCRAVO 0x08
+  DBG("STEP7 i2c slave ok");
+
+  WiFi.scanNetworks(true,true); scanBLE();
+  DBG("STEP8 scans disparados");
+  DBG("PRONTA");
+}
+
+void loop(){
+  static uint32_t t1=0;
+  if(millis()-t1>=1000){ t1=millis(); atualizarBateria(); montarLive(); }
+  static uint32_t tw=0;
+  if(millis()-tw>=8000){ tw=millis(); coletarWiFi(); }
+  if(!bleBusy && millis()-bleT>15000) scanBLE();
+  lerTerminal(Serial2, bufTerm2);     // terminal pelo Pi
+  lerTerminal(Serial,  bufTerm0);     // terminal pela USB (teste)
+  static uint32_t tled=0;
+  if(millis()-tled>=20){ tled=millis(); ledStatus(); }   // 50 Hz: batimento suave
+}

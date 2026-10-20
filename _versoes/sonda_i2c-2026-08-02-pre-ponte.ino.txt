@@ -1,0 +1,535 @@
+/*
+ * SONDA ESP32 — 5 fios: I2C escravo (telemetria) + UART2 (terminal)
+ * ----------------------------------------------------------------
+ * Arquitetura de ARQUITETURA-5fios.md (decisão do Thiago, 2026-08-01).
+ *   - I2C (GPIO21 SDA / GPIO22 SCL): ESP é ESCRAVO 0x08. O Pi (mestre) puxa o
+ *     JSON de telemetria (bateria + scans WiFi/BLE).
+ *   - UART2 (GPIO16 RX / GPIO17 TX @115200): terminal interativo. Comandos de
+ *     texto (scan/bat/wifi/ble/reboot/help) → resposta em texto. Também aceita
+ *     os mesmos comandos pela USB (Serial0) p/ testar sem o Pi.
+ *
+ * Fiação (3,3V dos 2 lados, SEM level shifter):
+ *   I2C  não cruza:  ESP GPIO21<->Pi SDA(pino3) ; ESP GPIO22<->Pi SCL(pino5)
+ *   UART cruza:      ESP GPIO17(TX2)->Pi RXD(pino10) ; ESP GPIO16(RX2)<-Pi TXD(pino8)
+ *   GND comum (pino6) obrigatório, compartilhado pelos 2 barramentos.
+ * Bateria: divisor 100k/100k no GPIO34 (ADC1 — funciona com WiFi).
+ *
+ * Blindagem do escravo I2C (o Wire slave é frágil durante scan):
+ *   - scan é ASSÍNCRONO (loop nunca trava) e BLE por callback;
+ *   - a telemetria é montada num buffer "live" no loop;
+ *   - o Pi, ao escrever o registrador 0x00, LATCHA o live num snapshot estável;
+ *   - o onRequest só COPIA do snapshot (nada de processar no callback).
+ *
+ * LED RGB com UM resistor no comum (mudança de fiação de 02/08) — LEIA ANTES DE MEXER:
+ *   Fiação: os 3 anodos vão DIRETO aos GPIO (sem resistor por canal) e o catodo comum
+ *   vai ao GND por UM resistor único. Isso torna a mistura de cor em DC IMPOSSÍVEL:
+ *   o die vermelho tem Vf ~1,9 V contra ~3,0 V do verde/azul, então ele conduz primeiro,
+ *   levanta a tensão do nó comum e deixa os outros dois SEM headroom para acender.
+ *   Medido no modelo (calc_led_comum.py): com 47 Ω e os 3 canais em 100%, o nó comum sobe
+ *   a 0,77 V e o verde e o azul recebem 0,00 mA. Amarelo, branco e roxo virariam VERMELHO.
+ *   NENHUM ajuste de duty conserta isso — o problema é o nó comum, não o duty.
+ *   Solução aqui: PWM MULTIPLEXADO NO TEMPO. Os 3 canais compartilham um timer do LEDC
+ *   e cada um recebe uma FASE diferente (hpoint), de forma que só um die conduz por vez.
+ *   O resistor comum passa a se comportar como um resistor por canal e a mistura vira
+ *   temporal (o olho integra). Ver o bloco "FAROL RGB" abaixo.
+ *
+ * Três LEDs, três perguntas — cada sinal num lugar só:
+ *   RGB (25/26/27, 1 resistor no comum) = QUAL É O ESTADO (cor estável)
+ *   onboard GPIO2                       = ESTÁ VIVA (batimento lub-dub 1,2 s)
+ *   azul avulso GPIO4                   = TEM VARREDURA RODANDO (pisca 2 Hz)
+ * O scan saiu do RGB porque roda ~60% do tempo e abafava todos os outros estados.
+ */
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_flash.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include "driver/ledc.h"   // ledc_set_duty_with_hpoint(): a FASE de cada janela de PWM
+
+// ---- pinos / config
+static const uint8_t I2C_ADDR = 0x08;
+static const int PIN_SDA = 21, PIN_SCL = 22;
+static const int PIN_TX2 = 17, PIN_RX2 = 16;
+static const uint32_t BAUD_TERM = 115200;
+static const int   PIN_BAT = 34;
+static const float DIVISOR = 2.0f;
+// CALIBRACAO (01/08): sem correcao a sonda lia 4.147 V com o multimetro medindo 3.81 V
+// na celula (+8,8%). Fator = 3.81/4.147. Causa provavel: Vref do ADC deste chip (o ESP32
+// usa 1100 mV default quando nao tem eFuse de calibracao) e/ou tolerancia dos resistores.
+// Pra recalibrar: zere p/ 1.0, leia "bat", meça a celula e refaça medido/lido.
+static const float CAL_ADC = 0.9187f;
+static const float V_CHEIA=4.15f, V_OK=3.60f, V_BAIXA=3.40f, V_CRITICA=3.20f;
+// abaixo disso nao ha bateria no divisor (placa so no USB) -> nao e "critico", e "sem bateria"
+static const float V_SEM_BAT=1.00f;
+
+// ---- LED RGB de status (4 pinos: R,G,B + comum)
+// FIACAO REAL, provada 3x na bancada (firmware led_teste + observacao do estado ocioso):
+//   GPIO25 -> die AZUL | GPIO26 -> die VERDE | GPIO27 -> die VERMELHO
+// O LED entrou espelhado no soquete, entao R e B vem TROCADOS de proposito aqui.
+// Tentamos a ordem natural em 02/08 e o estado ocioso (azul respirando) saiu VERMELHO
+// respirando -> prova de que o espelhamento e fisico. NAO "arrumar" sem re-testar com
+// "led r" / "led b": o ciclo do led_teste e a fonte da verdade.
+static const int PIN_R=27, PIN_G=26, PIN_B=25;
+// 1o LED tinha o die verde morto (GPIO26 provado vivo); trocado -> paleta completa de volta.
+static const bool TEM_VERDE = true;
+
+// ---- LED da placa (onboard) = batimento cardiaco, em CONTRAFASE com o azul do RGB
+static const int  PIN_PLACA = 2;              // LED azul onboard da maioria dos DevKit
+static const bool PLACA_INVERTIDO = false;    // true se o onboard acender em nivel BAIXO
+static const uint16_t HB_PERIODO = 1200;      // ms do ciclo completo do batimento
+// O pulso vive SO no LED da placa (decisao do Thiago, 02/08): o RGB fica com cor estavel,
+// entao "esta viva" se le no onboard e "qual o estado" se le na cor. Um sinal, um lugar.
+static const uint8_t  AZUL_OCIOSO = 90;       // nivel (0-255) do azul quando viva e sem o Pi
+// Comum no GND (catodo comum) e OBRIGATORIO nesta topologia. Anodo comum NAO funciona com
+// multiplex por hpoint: inverter a saida do LEDC inverte o PULSO INTEIRO, entao cada canal
+// passaria a conduzir durante as janelas dos outros dois e a sobreposicao volta.
+// Se um dia o LED for anodo comum, o caminho e transistor por canal, nao um flag.
+static const bool COMMON_ANODE = false;
+volatile uint32_t lastI2Cms = 0;      // quando o Pi leu por I2C pela última vez
+// teste manual de canal (comando "led r|g|b|off"): trava a cor ate expirar
+uint32_t ledTesteAte=0; uint8_t ledTR=0, ledTG=0, ledTB=0;
+uint32_t ledCicloAte=0;               // demo "led ciclo": passeia pelas 7 cores
+static const uint32_t TESTE_MS = 60000;   // duracao da cor travada (calibrar leva mais que 30s)
+
+// ================= FAROL RGB — PWM MULTIPLEXADO NO TEMPO (1 resistor no comum) =========
+// POR QUE: com resistor unico no comum, dois dies acesos ao mesmo tempo brigam pelo mesmo
+// resistor e o de menor Vf (vermelho) rouba tudo. Aqui NUNCA ha dois acesos ao mesmo tempo.
+//
+// COMO: um unico timer do LEDC (4 kHz, 12 bits = 4096 contagens por periodo) alimenta os 3
+// canais. Cada canal recebe um HPOINT diferente = a contagem em que ele SOBE. Como todos
+// compartilham o mesmo contador, as janelas ficam travadas entre si para sempre:
+//
+//   contagem:  0        1365        2730        4096
+//              |  R on  |   G on   |   B on    |
+//              |<-1333->|<--1333-->|<--1333--->|   (32 contagens de guarda no fim de cada)
+//
+// O core 3.3.0 poe os 4 canais no MESMO timer porque ledcAttachChannel() com a MESMA
+// frequencia e resolucao cai no find_matching_timer() (esp32-hal-ledc.c:62,227).
+// ledcWrite() -> ledc_set_duty(), que a IDF documenta como "do not change the hpoint value"
+// (driver/ledc.h:277) — por isso a fase e' programada UMA vez no setup e sobrevive ao loop.
+//
+// PROIBIDO nos pinos 2/25/26/27, porque quebra a fase EM SILENCIO (verificado no fonte):
+//   - ledcChangeFrequency / analogWriteFrequency / analogWriteResolution / ledcWriteTone /
+//     ledcWriteNote / tone(): todos reconfiguram o TIMER COMPARTILHADO (esp32-hal-ledc.c:483
+//     usa bus->timer_num), entao mudam os 4 canais de uma vez e os HPOINT, que sao contagens
+//     ABSOLUTAS, deixam de ser tercos do periodo.
+//   - ledcFade* / ledcFadeGamma*: esp32-hal-ledc.c:585 chama
+//     ledc_set_duty_and_update(group, channel, start_duty, 0) com hpoint ZERO hard-coded —
+//     um fade de hardware apaga a fase daquele canal. Para "respirar" o RGB, escreva o duty
+//     no loop (e o que ledStatus() faz), nunca fade de hardware.
+static const uint8_t  CH_R=0, CH_G=1, CH_B=2, CH_PLACA=3, CH_SCAN=4;  // 0..7 = grupo 0 = HIGH_SPEED
+static_assert(CH_SCAN < SOC_LEDC_CHANNEL_NUM, "os CH_* tem de caber no grupo 0 (HIGH_SPEED)");
+// 4 kHz: a 1 kHz cada die acende por 333 us e o olho, numa sacada, separa os 3 campos ->
+// rastro arco-iris; e o rolling shutter do celular (8-30 us por linha) filma o LED em faixas
+// R/G/B. A 4 kHz o divisor ainda e EXATO: 80e6*256/(4000*4096) = 1250, erro 0 ppm.
+// FATIA/GUARDA/JANELA/HPOINT sao em CONTAGENS, nao em tempo: mudar a frequencia nao mexe neles.
+static const uint32_t PWM_HZ  = 4000;
+static const uint8_t  PWM_RES = 12;                        // 12 bits -> 4000*4096 = 16,4 MHz << 80 MHz
+static const uint16_t PWM_PER = 1u << PWM_RES;             // 4096 contagens no periodo
+static const uint16_t FATIA   = PWM_PER/3;                 // 1365 contagens por canal
+static const uint16_t GUARDA  = 32;                        // 1,95 us de folga a 4 kHz (tau do no ~ns)
+static const uint16_t JANELA  = FATIA - GUARDA;            // 1333 = duty MAXIMO por canal
+static const uint16_t HPOINT[3] = { 0, FATIA, 2*FATIA };   // fase de R, G, B
+
+// GANHO por canal = fracao da janela usada quando a cor pede 255 naquele canal.
+// Vem de duty_c ~ Y_c / (luz por contagem do die c), com Y = luminancia sRGB
+// (R 0,2126 / G 0,7152 / B 0,0722) e a corrente de pico de cada die no modelo eletrico.
+// O vermelho leva ~3x mais corrente que verde/azul (Vf menor) E o olho pesa o verde 3,4x
+// mais que o vermelho -> por isso o vermelho fica em ~31% da janela e o verde em 100%.
+// IMPORTANTE: estes ganhos sao quase INDEPENDENTES do valor do resistor comum (0,303 com
+// 22 ohm ate 0,313 com 330 ohm) — o resistor muda o BRILHO, nao a cor. Nao precisa recalcular
+// se trocar o resistor. A maior incerteza e a razao de mcd entre os dies (varia por lote):
+// se a cor sair torta, calibre a olho com "led ganho <r> <g> <b>" e crave os numeros aqui.
+float GANHO[3] = { 0.31f, 1.00f, 0.505f };   // R, G, B
+static uint16_t gamaLUT[256];                // sRGB -> luz linear (gamma 2.2), 0..65535
+
+// ---- LED DE SCAN: azul comum, avulso, com resistor proprio (decisao do Thiago, 02/08)
+// Saiu do RGB DE PROPOSITO: a varredura WiFi/BLE roda ~60% do tempo (coletarWiFi rearma o
+// scan a cada chamada), entao "escaneando" sequestrava a cor e os estados que importam
+// (Pi lendo / ocioso / bateria) quase nunca apareciam. Atividade agora tem lugar proprio.
+// Fiacao: anodo (perna longa) no GPIO4, catodo -> resistor -> GND. Circuito INDEPENDENTE do
+// RGB: nao entra no multiplex, pode acender junto com qualquer cor.
+// GPIO4 e' seguro: nao e' strapping, nao pulsa no boot, tem pulldown fraco no reset (LED
+// apagado ate o setup) e nao gasta ADC1. Alternativas: 13, 18, 19, 23. NUNCA 0/2/5/12/15.
+static const int      PIN_SCAN   = 4;
+static const uint8_t  SCAN_NIVEL = 255;   // 0-255 (passa pelo mesmo gamma). Baixe se ofuscar
+static const uint16_t SCAN_MEIO_MS = 250; // meio periodo -> pisca a 2 Hz
+
+// ---- registradores I2C
+static const uint8_t REG_LEN  = 0x00;   // Pi escreve -> latcha; lê 2 bytes (LEN uint16 LE)
+static const uint8_t REG_DATA = 0x01;   // Pi lê em blocos de 32B, cursor avança
+static const int CHUNK = 32;
+
+// ---- estado
+float baterioV=0; int baterioPct=0; String baterioMsg="-";
+struct RedeWiFi { String ssid; int rssi,canal; String cripto; };
+RedeWiFi wifiAch[24]; uint8_t wifiQtd=0;
+struct DispBLE { String end,nome; int rssi; };
+DispBLE bleAch[24]; uint8_t bleQtd=0;
+BLEScan *bleScan=nullptr; bool bleBusy=false; uint32_t bleT=0;
+
+// buffers da telemetria
+char live[3072]; volatile uint16_t liveLen=0;              // montado no loop
+char snap[3072]; volatile uint16_t snapLen=0;              // latchado p/ o I2C
+volatile uint16_t cursor=0; volatile uint8_t reg=REG_LEN;
+
+// ---- bateria
+float lerBateria(){ uint32_t s=0; for(int i=0;i<16;i++){s+=analogReadMilliVolts(PIN_BAT);delay(2);} return (s/16.0f)*DIVISOR*CAL_ADC/1000.0f; }
+// tabela de descarga da LiPo: {tensao, %}, do cheio pro vazio. Interpola dentro do degrau.
+int pctLiPo(float v){
+  static const float t[][2]={{4.20,100},{4.10,90},{4.00,80},{3.90,70},{3.85,60},{3.80,50},
+                             {3.75,40},{3.70,30},{3.60,20},{3.50,12},{3.40,7},{3.30,3},{3.00,0}};
+  static const int N = sizeof(t)/sizeof(t[0]);
+  if(v>=t[0][0])   return 100;
+  if(v<=t[N-1][0]) return 0;
+  for(int i=0;i<N-1;i++){
+    if(v<=t[i][0] && v>=t[i+1][0]){                     // achou o degrau que contem v
+      float f=(v-t[i+1][0])/(t[i][0]-t[i+1][0]);        // 0 no fundo do degrau, 1 no topo
+      return (int)(t[i+1][1] + f*(t[i][1]-t[i+1][1]) + 0.5f);
+    }
+  }
+  return 50;
+}
+void atualizarBateria(){
+  baterioV=lerBateria(); baterioPct=pctLiPo(baterioV);
+  if(baterioV<V_SEM_BAT) baterioMsg="sem bateria (alimentada pelo USB)";
+  else if(baterioV<V_CRITICA) baterioMsg="CRITICA - desligue e carregue ja (risco de dano)";
+  else if(baterioV<V_BAIXA) baterioMsg="carregar agora";
+  else if(baterioV<V_OK) baterioMsg="carregar em breve";
+  else if(baterioV>=V_CHEIA) baterioMsg="cheia / carregando";
+  else baterioMsg="ok";
+}
+
+// ---- BLE / WiFi
+class CbBLE : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice d) override {
+    String e=d.getAddress().toString().c_str();
+    for(uint8_t i=0;i<bleQtd;i++) if(bleAch[i].end==e){bleAch[i].rssi=d.getRSSI();return;}
+    if(bleQtd>=24)return;
+    bleAch[bleQtd].end=e; bleAch[bleQtd].nome=d.haveName()?String(d.getName().c_str()):String("(sem nome)");
+    bleAch[bleQtd].rssi=d.getRSSI(); bleQtd++;
+  }
+};
+void scanBLE(){ if(bleBusy)return; bleQtd=0; bleBusy=true;
+  bleScan->start(4,[](BLEScanResults r){bleBusy=false;},false); bleT=millis(); }
+const char* cripto(wifi_auth_mode_t m){ switch(m){
+  case WIFI_AUTH_OPEN:return "aberta"; case WIFI_AUTH_WEP:return "WEP";
+  case WIFI_AUTH_WPA_PSK:return "WPA"; case WIFI_AUTH_WPA2_PSK:return "WPA2";
+  case WIFI_AUTH_WPA_WPA2_PSK:return "WPA/2"; case WIFI_AUTH_WPA3_PSK:return "WPA3";
+  case WIFI_AUTH_WPA2_WPA3_PSK:return "WPA2/3"; default:return "?";} }
+void coletarWiFi(){
+  int n=WiFi.scanComplete();
+  if(n==WIFI_SCAN_FAILED){ WiFi.scanNetworks(true,true); return; }
+  if(n==WIFI_SCAN_RUNNING) return;
+  wifiQtd=0;
+  for(int i=0;i<n&&wifiQtd<24;i++)
+    wifiAch[wifiQtd++]={ WiFi.SSID(i).length()?WiFi.SSID(i):String("(oculta)"),
+                         WiFi.RSSI(i), WiFi.channel(i), String(cripto(WiFi.encryptionType(i))) };
+  WiFi.scanDelete(); WiFi.scanNetworks(true,true);
+}
+
+// ---- monta a telemetria (link=i2c) no buffer live
+void montarLive(){
+  String j="{\"bat\":{\"v\":"; j+=String(baterioV,3); j+=",\"pct\":"; j+=baterioPct;
+  j+=",\"msg\":\""; j+=baterioMsg; j+="\"}";
+  j+=",\"wifi\":[";
+  for(uint8_t i=0;i<wifiQtd;i++){ if(i)j+=",";
+    j+="{\"s\":\""; j+=wifiAch[i].ssid; j+="\",\"r\":"; j+=wifiAch[i].rssi;
+    j+=",\"c\":"; j+=wifiAch[i].canal; j+=",\"k\":\""; j+=wifiAch[i].cripto; j+="\"}"; }
+  j+="]";
+  j+=",\"ble\":[";
+  for(uint8_t i=0;i<bleQtd;i++){ if(i)j+=",";
+    j+="{\"e\":\""; j+=bleAch[i].end; j+="\",\"n\":\""; j+=bleAch[i].nome;
+    j+="\",\"r\":"; j+=bleAch[i].rssi; j+="}"; }
+  j+="]";
+  uint32_t fl=0; esp_flash_get_size(NULL,&fl); uint32_t up=millis()/1000;
+  j+=",\"sis\":{\"mac\":\""; j+=WiFi.macAddress();
+  j+="\",\"flash_mb\":"; j+=fl/(1024*1024);
+  j+=",\"heap_kb\":"; j+=ESP.getFreeHeap()/1024;
+  j+=",\"up_s\":"; j+=up; j+=",\"link\":\"i2c\"}}\n";
+  uint16_t n=j.length(); if(n>=sizeof(live))n=sizeof(live)-1;
+  memcpy(live, j.c_str(), n); live[n]=0; liveLen=n;
+}
+
+// ---- LED RGB de status — sRGB -> gamma -> ganho do canal -> duty dentro da janela
+// Anodo comum quebraria a multiplexacao (ver comentario do COMMON_ANODE): falha no build.
+static_assert(!COMMON_ANODE, "multiplex por hpoint exige CATODO comum (comum no GND)");
+
+static inline float luzLinear(uint8_t v){ return gamaLUT[v]*(1.0f/65535.0f); }
+static uint16_t dutyDe(uint8_t v, float ganho){
+  if(!v) return 0;
+  uint32_t d = (uint32_t)(luzLinear(v)*ganho*JANELA + 0.5f);
+  return (uint16_t)(d > JANELA ? JANELA : d);   // clamp: passar da janela invade o vizinho
+}
+void setColor(uint8_t r,uint8_t g,uint8_t b){
+  ledcWrite(PIN_R, dutyDe(r,GANHO[0]));
+  ledcWrite(PIN_G, dutyDe(g,GANHO[1]));
+  ledcWrite(PIN_B, dutyDe(b,GANHO[2]));
+}
+// mesmo matiz, nivel geral 0..255. Escalar ANTES do gamma preserva a cor ao escurecer.
+void setCorN(uint8_t r,uint8_t g,uint8_t b,uint8_t n){
+  setColor((uint16_t)r*n/255, (uint16_t)g*n/255, (uint16_t)b*n/255);
+}
+// Poe os 4 canais no MESMO timer e trava a fase de R/G/B. Unico lugar que mexe com hpoint.
+static const uint8_t CH_RGB[3] = { CH_R, CH_G, CH_B };
+bool farolQuebrado = false;
+bool farolSetup(){
+  for(int v=0;v<256;v++) gamaLUT[v] = (uint16_t)(65535.0f*powf(v/255.0f,2.2f)+0.5f);
+  bool ok = true;
+  const int pin[5] = { PIN_R, PIN_G, PIN_B, PIN_PLACA, PIN_SCAN };
+  const uint8_t ch5[5] = { CH_R, CH_G, CH_B, CH_PLACA, CH_SCAN };
+  for(int i=0;i<5;i++)                                    // mesma freq/res nos 5 = mesmo timer
+    if(!ledcAttachChannel(pin[i], PWM_HZ, PWM_RES, ch5[i])){
+      Serial.printf("FAROL: attach do GPIO%d (canal %u) falhou\n", pin[i], ch5[i]); ok=false;
+    }
+  for(int i=0;i<3;i++){
+    esp_err_t e1 = ledc_set_duty_with_hpoint(LEDC_HIGH_SPEED_MODE,(ledc_channel_t)CH_RGB[i],0,HPOINT[i]);
+    esp_err_t e2 = ledc_update_duty(LEDC_HIGH_SPEED_MODE,(ledc_channel_t)CH_RGB[i]);
+    if(e1!=ESP_OK || e2!=ESP_OK){
+      Serial.printf("FAROL: fase do canal %c falhou (%d/%d)\n", "RGB"[i], (int)e1, (int)e2); ok=false;
+    }
+  }
+  // FAIL-SAFE: sem fase, os 3 canais ficam com o hpoint que ledc_channel_config gravou, que e
+  // ZERO para todos (esp32-hal-ledc.c:258) => os 3 dies na mesma janela => o vermelho rouba
+  // tudo e o LED fica VERMELHO FIXO, indistinguivel do alarme de bateria critica. Entre mentir
+  // um alarme e nao acender, nao acender. O GPIO2 denuncia (ledStatus).
+  if(!ok){ farolQuebrado = true; ledcWrite(PIN_R,0); ledcWrite(PIN_G,0); ledcWrite(PIN_B,0); }
+  return ok;
+}
+// ---- batimento cardiaco (lub-dub): envelope 0..255 dentro de HB_PERIODO
+static uint8_t pulso(uint16_t x, uint16_t dur, uint8_t pico){
+  if(x>=dur) return 0;
+  uint16_t subida = dur/3;                               // sobe rapido, cai suave
+  if(x < subida) return (uint32_t)pico*x/subida;
+  return (uint32_t)pico*(dur-x)/(dur-subida);
+}
+uint8_t batimento(uint32_t now){
+  uint16_t t = now % HB_PERIODO;
+  if(t < 200)             return pulso(t,     200, 255); // "lub" — a batida forte
+  if(t >= 280 && t < 460) return pulso(t-280, 180, 150); // "dub" — a eco, mais fraca
+  return 0;                                              // diastole: descanso
+}
+
+// cores do "led ciclo" (demo de bancada): prova os 3 dies E as 3 misturas, uma a uma
+static const uint8_t CICLO[7][3] = {
+  {255,0,0}, {0,255,0}, {0,0,255},        // dies puros
+  {255,190,0}, {0,190,255}, {255,0,255},  // amarelo, ciano, magenta (so saem certos multiplexado)
+  {255,255,255}                            // branco
+};
+
+void ledStatus(){
+  uint32_t now=millis();
+  // LED de scan: vive fora de toda a logica de estado do RGB (inclusive dos testes manuais e
+  // do fail-safe), porque ele responde a UMA pergunta so: "tem varredura rodando agora?"
+  bool escaneando = (bleBusy || WiFi.scanComplete()==WIFI_SCAN_RUNNING);
+  uint8_t nScan = (escaneando && (now/SCAN_MEIO_MS)%2) ? SCAN_NIVEL : 0;
+  ledcWrite(PIN_SCAN, (uint32_t)(luzLinear(nScan)*(PWM_PER-1) + 0.5f));
+
+  if(farolQuebrado){                    // sem fase nao existe cor honesta: RGB apagado e o
+    setColor(0,0,0);                    // GPIO2 pisca rapido (nao e o lub-dub) para denunciar
+    ledcWrite(PIN_PLACA, ((now/120)%2) ? PWM_PER-1 : 0);
+    return;
+  }
+  uint8_t hb = batimento(now);
+  // LED da placa pulsa SEMPRE (sinal de "estou viva"), independente do status do RGB.
+  // Passa pelo mesmo gamma: o "lub-dub" fica com queda visualmente suave, nao em degrau.
+  uint32_t dhb = (uint32_t)(luzLinear(hb)*(PWM_PER-1) + 0.5f);
+  ledcWrite(PIN_PLACA, PLACA_INVERTIDO ? (PWM_PER-1)-dhb : dhb);
+
+  if(ledCicloAte){                                       // demo de bancada ganha de tudo
+    if((int32_t)(now-ledCicloAte) < 0){
+      const uint8_t *c = CICLO[(now/1200)%7];            // 1,2 s por cor
+      setColor(c[0],c[1],c[2]); return;
+    }
+    ledCicloAte=0;
+  }
+  if(ledTesteAte){                                       // teste manual de canal ganha do automatico
+    if((int32_t)(now-ledTesteAte) < 0){ setColor(ledTR,ledTG,ledTB); return; }
+    ledTesteAte=0;                                       // expirou -> volta ao automatico
+  }
+  bool piVivo = (lastI2Cms && now-lastI2Cms < 3000);   // Pi puxou I2C há pouco
+  bool semBat = (baterioV < V_SEM_BAT);                  // so USB: nao e critico, e ausencia
+  bool pisca = (now/500)%2;                              // blink 1Hz
+  // As cores abaixo sao MATIZES sRGB de saturacao cheia: quem faz o balanco e o GANHO[] do
+  // canal. Nao "escureca" a paleta baixando os numeros — use setCorN(), senao o matiz anda.
+  if(!semBat && baterioV < V_CRITICA){ setColor(pisca?255:0,0,0); }    // vermelho piscando
+  else if(!semBat && baterioV < V_BAIXA){                               // carregar
+    if(TEM_VERDE) setColor(255,120,0);                                  //   ambar/laranja
+    else          setColor(pisca?255:60,0,0); }                         //   vermelho pulsando (sem apagar)
+  // NAO existe mais estado "escaneando" aqui: foi para o LED azul do GPIO4. A varredura roda
+  // ~60% do tempo, entao como COR ela abafava tudo que importa. Como piscada num LED separado,
+  // ela e' so atividade — e o RGB volta a dizer o estado o tempo inteiro.
+  else if(piVivo){                                                      // Pi lendo (saudavel)
+    if(TEM_VERDE) setColor(0,255,40);                                   //   verde
+    else          setColor(0,0,255); }                                  //   azul FORTE fixo
+  else { setCorN(0,60,255,AZUL_OCIOSO); }    // azul fraco: vivo, sem Pi (o pulso e so da placa)
+}
+
+// ---- I2C escravo (callbacks rodam em task, não ISR, no core 3.x)
+void onReceiveI2C(int n){
+  if(n<=0)return;
+  reg = Wire.read();                       // 1º byte = registrador
+  while(Wire.available()) Wire.read();      // descarta o resto
+  if(reg==REG_LEN){                         // latcha um frame estável
+    uint16_t L=liveLen; if(L>=sizeof(snap))L=sizeof(snap)-1;
+    memcpy(snap, live, L); snapLen=L; cursor=0;
+  }
+}
+void onRequestI2C(){
+  if(reg==REG_LEN){
+    uint8_t b[2]={ (uint8_t)(snapLen & 0xFF), (uint8_t)(snapLen>>8) };
+    Wire.write(b,2);
+  } else {                                  // REG_DATA: próximo bloco de 32B
+    uint8_t buf[CHUNK];
+    for(int i=0;i<CHUNK;i++){ buf[i] = (cursor<snapLen)? (uint8_t)snap[cursor++] : 0; }
+    Wire.write(buf,CHUNK);
+  }
+  lastI2Cms = millis();                      // marca atividade do Pi (p/ o LED)
+}
+
+// ---- terminal (UART2 e USB)
+void responder(Stream &s, const String &cmd){
+  String c=cmd; c.trim(); c.toLowerCase();
+  if(c=="help"||c=="?"){
+    s.println("comandos: help  bat  wifi  ble  scan  sis  reboot");
+    s.println("  led <r|g|b|c|m|y|w|off|auto>   uma cor fixa por 30s");
+    s.println("  led ciclo                      passeia R,G,B,amarelo,ciano,magenta,branco (60s)");
+    s.println("  led ganho <R> <G> <B>          calibra a cor a olho (0-1000 = milesimos da janela)");
+    s.println("  led cal                        le a fase no HW e mostra ganhos/duty");
+  } else if(c.startsWith("led")){
+    String a=c.substring(3); a.trim();
+    uint8_t r=0,g=0,b=0; bool auto_=false;
+    // calibracao de bancada: "led ganho 310 1000 505" (milesimos da janela = decimos de %).
+    // Milesimo e nao inteiro de %: um passo de 1% desloca o branco em cima do limiar de
+    // discriminacao do olho, e a calibracao nunca converge. E sem float no sscanf, que na
+    // newlib-nano da IDF pode vir sem suporte a %f.
+    if(a.startsWith("ganho")){
+      int gr=-1,gg=-1,gb=-1;
+      if(sscanf(a.c_str()+5,"%d %d %d",&gr,&gg,&gb)==3 &&
+         gr>=0&&gr<=1000 && gg>=0&&gg<=1000 && gb>=0&&gb<=1000){
+        GANHO[0]=gr/1000.0f; GANHO[1]=gg/1000.0f; GANHO[2]=gb/1000.0f;
+        if(ledTesteAte) ledTesteAte = millis()+TESTE_MS;   // nao deixa o alvo expirar no meio
+        s.printf("ganho: R=%.1f%% G=%.1f%% B=%.1f%% da janela - julgue com 'led w' e 'led y'.\n",
+                 GANHO[0]*100, GANHO[1]*100, GANHO[2]*100);
+        s.println("       ficou bom? crave em GANHO[] no fonte e regrave (isto vive so na RAM).");
+      } else s.println("uso: led ganho <R> <G> <B>   (0 a 1000 = milesimos da janela; padrao 310 1000 505)");
+      return;
+    }
+    if(a=="cal"){
+      s.printf("multiplex: %u Hz pedidos / %u Hz no timer 0, %u bits, janela util %u de %u\n",
+               (unsigned)PWM_HZ, (unsigned)ledc_get_freq(LEDC_HIGH_SPEED_MODE, LEDC_TIMER_0),
+               PWM_RES, JANELA, FATIA);
+      // le a fase do REGISTRADOR, nao da constante: e a unica prova de que o multiplex existe
+      for(int i=0;i<3;i++){
+        int hp = ledc_get_hpoint(LEDC_HIGH_SPEED_MODE,(ledc_channel_t)CH_RGB[i]);
+        s.printf("  %c: ganho %.1f%%  duty max %u  fase lida %d (esperada %u) %s\n",
+                 "RGB"[i], GANHO[i]*100, dutyDe(255,GANHO[i]), hp, HPOINT[i],
+                 hp==(int)HPOINT[i] ? "OK" : "QUEBRADA -> a cor vai sair errada");
+      }
+      s.printf("led de scan: GPIO%d, nivel %u, pisca a %.1f Hz - agora %s\n", PIN_SCAN,
+               SCAN_NIVEL, 500.0f/SCAN_MEIO_MS,
+               (bleBusy||WiFi.scanComplete()==WIFI_SCAN_RUNNING) ? "VARRENDO" : "parado");
+      return;
+    }
+    if(a=="ciclo"){
+      ledCicloAte=millis()+60000; if(!ledCicloAte)ledCicloAte=1;
+      s.println("led: ciclo R,G,B,amarelo,ciano,magenta,branco - 1,2s cada, por 60s.");
+      s.println("     amarelo/ciano/magenta so saem certos porque o PWM e multiplexado.");
+      return;
+    }
+    if(a=="r"||a=="vermelho") r=255;
+    else if(a=="g"||a=="verde") g=255;
+    else if(a=="b"||a=="azul") b=255;
+    else if(a=="c"||a=="ciano"){ g=190; b=255; }
+    else if(a=="m"||a=="magenta"){ r=255; b=255; }
+    else if(a=="y"||a=="amarelo"){ r=255; g=190; }
+    else if(a=="w"||a=="branco"){ r=g=b=255; }
+    else if(a=="off"||a=="apaga"){ /* tudo 0 */ }
+    else if(a==""||a=="auto") auto_=true;
+    else { s.println("uso: led r|g|b|c|m|y|w|off|auto|ciclo|cal|ganho"); return; }
+    if(auto_){ ledTesteAte=0; ledCicloAte=0; s.println("led: automatico (status)"); }
+    else { ledTR=r; ledTG=g; ledTB=b; ledCicloAte=0;
+           ledTesteAte=millis()+TESTE_MS; if(!ledTesteAte)ledTesteAte=1;
+           s.printf("led: cor fixa R=%u G=%u B=%u por %us (o que voce VE?)\n",
+                    r,g,b,(unsigned)(TESTE_MS/1000)); }
+  } else if(c=="bat"){
+    s.printf("bateria: %.3f V  %d%%  (%s)\n", baterioV, baterioPct, baterioMsg.c_str());
+  } else if(c=="wifi"){
+    s.printf("%u redes 2,4GHz:\n", wifiQtd);
+    for(uint8_t i=0;i<wifiQtd;i++) s.printf("  %-24s ch%-3d %-6s %d dBm\n",
+      wifiAch[i].ssid.c_str(), wifiAch[i].canal, wifiAch[i].cripto.c_str(), wifiAch[i].rssi);
+  } else if(c=="ble"){
+    s.printf("%u dispositivos BLE:\n", bleQtd);
+    for(uint8_t i=0;i<bleQtd;i++) s.printf("  %s  %-18s %d dBm\n",
+      bleAch[i].end.c_str(), bleAch[i].nome.c_str(), bleAch[i].rssi);
+  } else if(c=="scan"){
+    WiFi.scanNetworks(true,true); scanBLE();
+    s.printf("scan disparado (WiFi+BLE) - o LED azul do GPIO%d tem que piscar por ~4s\n", PIN_SCAN);
+  } else if(c=="sis"){
+    uint32_t fl=0; esp_flash_get_size(NULL,&fl);
+    s.printf("MAC %s | flash %u MB | heap %u KB | up %lus\n",
+      WiFi.macAddress().c_str(), fl/(1024*1024), ESP.getFreeHeap()/1024, millis()/1000);
+  } else if(c=="reboot"){
+    s.println("reiniciando..."); delay(200); ESP.restart();
+  } else if(c.length()){
+    s.println("? (digite help)");
+  }
+}
+String bufTerm2="", bufTerm0="";
+void lerTerminal(Stream &s, String &buf){
+  while(s.available()){
+    char ch=(char)s.read();
+    if(ch=='\r') continue;
+    if(ch=='\n'){ responder(s, buf); buf=""; }
+    else if(buf.length()<120) buf+=ch;
+  }
+}
+
+#define DBG(x) do{ Serial.println(x); Serial.flush(); }while(0)
+void setup(){
+  Serial.begin(115200); delay(300);
+  DBG("STEP1 serial ok");
+  Serial2.begin(BAUD_TERM, SERIAL_8N1, PIN_RX2, PIN_TX2);
+  analogReadResolution(12); analogSetPinAttenuation(PIN_BAT, ADC_11db);
+  DBG("STEP2 uart+adc ok");
+
+  // sem pinMode: ledcAttachChannel() e quem toma o pino e roteia o PWM
+  if(farolSetup()) DBG("STEP3 led ok (R/G/B multiplexados por fase, 1 resistor no comum)");
+  else             DBG("STEP3 LED FALHOU: sem canal/timer do LEDC -> a cor vai sair errada");
+  setCorN(0,60,255,AZUL_OCIOSO);
+
+  WiFi.mode(WIFI_STA); WiFi.disconnect();
+  DBG("STEP4 wifi ok");
+  BLEDevice::init("");
+  bleScan=BLEDevice::getScan();
+  bleScan->setAdvertisedDeviceCallbacks(new CbBLE(), true);
+  bleScan->setActiveScan(true); bleScan->setInterval(100); bleScan->setWindow(99);
+  DBG("STEP5 ble ok");
+
+  atualizarBateria(); montarLive();
+  memcpy(snap,live,liveLen); snapLen=liveLen;
+  DBG("STEP6 telemetria ok");
+
+  Wire.setPins(PIN_SDA, PIN_SCL);          // pinos ANTES do begin
+  Wire.onReceive(onReceiveI2C);            // callbacks ANTES do begin (exigencia do slave 3.x)
+  Wire.onRequest(onRequestI2C);
+  Wire.begin(I2C_ADDR);                     // agora sobe como ESCRAVO 0x08
+  DBG("STEP7 i2c slave ok");
+
+  WiFi.scanNetworks(true,true); scanBLE();
+  DBG("STEP8 scans disparados");
+  DBG("PRONTA");
+}
+
+void loop(){
+  static uint32_t t1=0;
+  if(millis()-t1>=1000){ t1=millis(); atualizarBateria(); montarLive(); }
+  static uint32_t tw=0;
+  if(millis()-tw>=8000){ tw=millis(); coletarWiFi(); }
+  if(!bleBusy && millis()-bleT>15000) scanBLE();
+  lerTerminal(Serial2, bufTerm2);     // terminal pelo Pi
+  lerTerminal(Serial,  bufTerm0);     // terminal pela USB (teste)
+  static uint32_t tled=0;
+  if(millis()-tled>=20){ tled=millis(); ledStatus(); }   // 50 Hz: batimento suave
+}

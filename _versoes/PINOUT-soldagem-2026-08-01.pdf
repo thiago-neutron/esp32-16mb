@@ -1,0 +1,209 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 4 /Kids [5 0 R 7 0 R 9 0 R 11 0 R] >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Length 1944 >>
+stream
+BT
+/F1 9 Tf
+11.3 TL
+34 802.0 Td
+() Tj T*
+(================================================================================) Tj T*
+(  SONDA ESP32 + Raspberry Pi Zero W  --  GUIA DE SOLDAGEM \(5 fios\)) Tj T*
+(  firmware: sonda_i2c  |  2026-08-01  |  niveis 3,3V dos 2 lados \(sem shifter\)) Tj T*
+(================================================================================) Tj T*
+() Tj T*
+(  OS 5 FIOS  \(I2C = telemetria ; UART = terminal\)) Tj T*
+() Tj T*
+(     ESP32                                   Raspberry Pi Zero W) Tj T*
+(   +----------+                            +----------------------+) Tj T*
+(   |  GPIO21  |---- SDA  \(NAO cruza\) ------|  pino 3   \(SDA\)      |) Tj T*
+(   |  GPIO22  |---- SCL  \(NAO cruza\) ------|  pino 5   \(SCL\)      |) Tj T*
+(   |  GPIO17  |==== TX  >>> CRUZA >>> =====|  pino 10  \(RXD\)     |) Tj T*
+(   |  GPIO16  |==== RX  <<< CRUZA <<< =====|  pino 8   \(TXD\)     |) Tj T*
+(   |   GND    |---- GND ------------------ |  pino 6   \(GND\)     |) Tj T*
+(   +----------+                            +----------------------+) Tj T*
+() Tj T*
+(   REGRA:  I2C nao cruza \(SDA<->SDA, SCL<->SCL\)) Tj T*
+(           UART cruza    \(TX->RX dos dois lados\)) Tj T*
+(           GND comum e OBRIGATORIO \(referencia dos 2 barramentos\)) Tj T*
+() Tj T*
+(  --------------------------------------------------------------------------) Tj T*
+(  TABELA RESUMO) Tj T*
+() Tj T*
+(    #  | funcao        | ESP32        | Pi \(pino fisico\)   | cruza?) Tj T*
+(   ----+---------------+--------------+--------------------+-------) Tj T*
+(    1  | I2C dados SDA | GPIO21       | 3                  | nao) Tj T*
+(    2  | I2C clock SCL | GPIO22       | 5                  | nao) Tj T*
+(    3  | UART ESP->Pi  | GPIO17 \(TX2\) | 10 \(RXD\)           | SIM) Tj T*
+(    4  | UART Pi->ESP  | GPIO16 \(RX2\) | 8  \(TXD\)           | SIM) Tj T*
+(    5  | terra comum   | GND          | 6                  | -) Tj T*
+() Tj T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 1594 >>
+stream
+BT
+/F1 9 Tf
+11.3 TL
+34 802.0 Td
+() Tj T*
+(================================================================================) Tj T*
+(  RASPBERRY PI ZERO W  --  header de 40 pinos) Tj T*
+(================================================================================) Tj T*
+() Tj T*
+(  Orientacao: conector de 40 pinos no topo, com o slot do cartao/USB) Tj T*
+(  apontando para BAIXO.  Pino 1 = canto superior ESQUERDO.) Tj T*
+() Tj T*
+(     3V3  \( 1\) \( 2\)  5V      <== [opc] 5V p/ VIN do ESP) Tj T*
+(   GPIO2  \( 3\) \( 4\)  5V          \(SDA\)   *** USADO: fio 1) Tj T*
+(   GPIO3  \( 5\) \( 6\)  GND     <== \(SCL\)   *** USADO: fio 2   /   GND fio 5) Tj T*
+(   GPIO4  \( 7\) \( 8\)  GPIO14      \(TXD\)   *** USADO: fio 4  \(Pi TX -> ESP RX\)) Tj T*
+(     GND  \( 9\) \(10\)  GPIO15      \(RXD\)   *** USADO: fio 3  \(Pi RX <- ESP TX\)) Tj T*
+(  GPIO17 \(11\) \(12\)  GPIO18) Tj T*
+(  GPIO27 \(13\) \(14\)  GND) Tj T*
+(  GPIO22 \(15\) \(16\)  GPIO23) Tj T*
+(     3V3 \(17\) \(18\)  GPIO24) Tj T*
+(  GPIO10 \(19\) \(20\)  GND) Tj T*
+(   ....           \(pinos 21..40 NAO usados neste projeto\)) Tj T*
+() Tj T*
+(  PINOS QUE VOCE SOLDA NO PI:   2\(ou nao\) , 3 , 5 , 6 , 8 , 10) Tj T*
+() Tj T*
+(  --------------------------------------------------------------------------) Tj T*
+(  CONFERENCIA RAPIDA \(decore os 3 de baixo\):) Tj T*
+(     pino 3  = SDA   -> ESP GPIO21) Tj T*
+(     pino 5  = SCL   -> ESP GPIO22) Tj T*
+(     pino 6  = GND   -> ESP GND) Tj T*
+(     pino 8  = TXD   -> ESP GPIO16 \(RX\)   [cruza]) Tj T*
+(     pino 10 = RXD   -> ESP GPIO17 \(TX\)   [cruza]) Tj T*
+() Tj T*
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 1642 >>
+stream
+BT
+/F1 9 Tf
+11.3 TL
+34 802.0 Td
+() Tj T*
+(================================================================================) Tj T*
+(  ESP32  --  bateria + LED RGB) Tj T*
+(================================================================================) Tj T*
+() Tj T*
+(  BATERIA \(1 celula LiPo\)  --  o ESP so LE a tensao, NAO se alimenta dela) Tj T*
+() Tj T*
+(     B+ da celula ---[ 100k ]---+---[ 100k ]--- GND) Tj T*
+(                                |) Tj T*
+(                             GPIO34   \(ADC1, le com o radio ligado\)) Tj T*
+() Tj T*
+(     GND da celula ------------ GND do ESP   \(comum\)) Tj T*
+() Tj T*
+(     * divisor por 2: 4,2V da celula -> ~2,1V no pino \(seguro p/ o ADC\)) Tj T*
+(     * use carregador COM protecao \(LiPo pouch nao perdoa sobre-descarga\)) Tj T*
+() Tj T*
+() Tj T*
+(  LED RGB de 4 pinos \(STATUS\)  --  CADA cor com resistor 220-330 ohm) Tj T*
+() Tj T*
+(       R \(perna\) ---[ 330 ]--- GPIO25) Tj T*
+(       G \(perna\) ---[ 330 ]--- GPIO26) Tj T*
+(       B \(perna\) ---[ 330 ]--- GPIO27) Tj T*
+(       comum ------------------ GND        \(catodo comum = padrao do codigo\)) Tj T*
+() Tj T*
+(     +-----------------------------------------------------------------+) Tj T*
+(     | NUNCA ligue a cor direto no GPIO sem resistor \(queima o LED e   |) Tj T*
+(     | forca o pino\). Azul/verde ficam um pouco mais fracos: normal.   |) Tj T*
+(     +-----------------------------------------------------------------+) Tj T*
+() Tj T*
+(     Se o comum do seu LED for o de +3,3V \(anodo comum\), as cores saem) Tj T*
+(     INVERTIDAS.  Nesse caso me avise: troco COMMON_ANODE=true e regravo.) Tj T*
+() Tj T*
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+10 0 obj
+<< /Length 1680 >>
+stream
+BT
+/F1 9 Tf
+11.3 TL
+34 802.0 Td
+() Tj T*
+(================================================================================) Tj T*
+(  ALIMENTACAO, STATUS DO LED e ACESSO AO SERIAL) Tj T*
+(================================================================================) Tj T*
+() Tj T*
+(  ALIMENTACAO  \(escolha UMA\)) Tj T*
+(     [A] cada placa no seu proprio cabo USB          <== mais seguro) Tj T*
+(     [B] Pi 5V \(pino 2\) ---> ESP VIN/5V              \(uma fonte so\)) Tj T*
+(         NUNCA 3V3<->3V3   |   NUNCA 5V em um GPIO) Tj T*
+() Tj T*
+() Tj T*
+(  O QUE O LED RGB INDICA) Tj T*
+(     azul respirando .... ligado, mas o Pi ainda nao esta lendo) Tj T*
+(     verde .............. Pi puxando telemetria por I2C \(tudo ok\)) Tj T*
+(     roxo ............... escaneando WiFi / BLE) Tj T*
+(     ambar .............. bateria baixa \(carregar\)) Tj T*
+(     vermelho piscando .. bateria critica) Tj T*
+() Tj T*
+() Tj T*
+(  ACESSAR O TERMINAL AGORA \(sem o Pi, so pela USB\)) Tj T*
+(     - abra a COM3 a 115200 \(Serial Monitor do Arduino IDE, ou PuTTY\)) Tj T*
+(     - comandos:  help   bat   wifi   ble   scan   sis   reboot) Tj T*
+(     - o mesmo terminal aparece depois na pagina /terminal do Pi) Tj T*
+() Tj T*
+() Tj T*
+(  CHECKLIST DE BRING-UP \(depois de soldar\)) Tj T*
+(     [ ] ESP no USB: 'bat' e 'wifi' respondem no terminal) Tj T*
+(     [ ] LED em verde quando o Pi comeca a ler \(senao azul\)) Tj T*
+(     [ ] no Pi:  i2cdetect -y 1   mostra  0x08) Tj T*
+(     [ ] painel do Pi em /  mostra bateria + scans) Tj T*
+(     [ ] /terminal do Pi: 'help' responde) Tj T*
+(================================================================================) Tj T*
+() Tj T*
+ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 10 0 R >>
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000140 00000 n 
+0000000235 00000 n 
+0000002231 00000 n 
+0000002357 00000 n 
+0000004003 00000 n 
+0000004129 00000 n 
+0000005823 00000 n 
+0000005949 00000 n 
+0000007682 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+7810
+%%EOF

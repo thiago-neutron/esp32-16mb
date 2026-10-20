@@ -1,0 +1,11 @@
+# senhas de WiFi — cada sketch tem um segredos.exemplo.h para copiar
+segredos.h
+
+# dumps do chip (o flash dump cobre a area onde o ESP32 guarda a senha do WiFi)
+*.bin
+
+# capturas de console do Pi (podem ter login)
+captura_*.txt
+
+# backups locais
+*.bak-*
